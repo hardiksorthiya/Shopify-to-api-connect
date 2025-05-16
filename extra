@@ -1,0 +1,262 @@
+const axios = require("axios");
+
+const SHOPIFY_STORE = "silvilus";
+const ACCESS_TOKEN = "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";
+const API_URL = "https://diasilvfinejewellery.com/webapi/api_stock.php";
+const SHORT_DESC_NAMESPACE = "bwp_fields";
+const SHORT_DESC_KEY = "shortdesc";
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchERPProducts() {
+  try {
+    const res = await axios.post(API_URL, {
+      userid: "devloper@eg.com",
+      password: "12345",
+    });
+    return res.data?.data || [];
+  } catch (err) {
+    console.error("❌ ERP fetch failed:", err.message);
+    return [];
+  }
+}
+
+async function getProductDetail(designno) {
+  try {
+    const res = await axios.post("https://diasilvfinejewellery.com/webapi/api_designdetail.php", {
+      userid: "devloper@eg.com",
+      password: "12345",
+      designno: designno,
+    });
+
+    const detail = res.data?.data?.[0]?.Product_Detail?.[0] || {};
+    const images = res.data?.data?.[0]?.Product_Image || [];
+
+    return {
+      category: detail.category || "",
+      collection: detail.collection || "",
+      subcategory: detail.subcategory || "",
+      images,
+    };
+  } catch (err) {
+    console.error(`❌ Error fetching details for ${designno}:`, err.message);
+    return { category: "", collection: "", subcategory: "", images: [] };
+  }
+}
+
+async function getLocationId() {
+  try {
+    const res = await axios.get(
+      `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2023-10/locations.json`,
+      { headers: { "X-Shopify-Access-Token": ACCESS_TOKEN } }
+    );
+    return res.data.locations[0]?.id;
+  } catch (err) {
+    console.error("❌ Location fetch failed:", err.message);
+    return null;
+  }
+}
+
+async function searchVariantBySKU(sku) {
+  try {
+    const res = await axios.get(
+      `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2023-10/products.json?fields=id,variants&limit=250`,
+      { headers: { "X-Shopify-Access-Token": ACCESS_TOKEN } }
+    );
+
+    for (const product of res.data.products) {
+      for (const variant of product.variants) {
+        if (variant.sku === sku) {
+          return {
+            productId: product.id,
+            inventoryItemId: variant.inventory_item_id,
+          };
+        }
+      }
+    }
+    return null;
+  } catch (err) {
+    console.error("❌ SKU search error:", err.message);
+    return null;
+  }
+}
+
+async function updateInventory(inventoryItemId, locationId, quantity) {
+  try {
+    await axios.post(
+      `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2023-10/inventory_levels/set.json`,
+      {
+        inventory_item_id: inventoryItemId,
+        location_id: locationId,
+        available: quantity,
+      },
+      { headers: { "X-Shopify-Access-Token": ACCESS_TOKEN } }
+    );
+    console.log(`✅ Inventory updated: ${inventoryItemId} → ${quantity}`);
+  } catch (err) {
+    console.error("❌ Inventory update failed:", err.message);
+  }
+}
+
+function generateDescriptions({ category, metal, dwt, quality }) {
+  const safeCategory = category || "jewellery";
+  const safeMetal = metal || "fine metal";
+  const safeDwt = dwt || "sparkling diamonds";
+  const safeQuality = quality || "exceptional craftsmanship";
+
+  const shortDesc = `Discover timeless elegance with our handcrafted ${safeCategory} made from premium ${safeMetal}. Designed with ${safeQuality} and embedded with ${safeDwt}, it reflects charm, luxury, and sophistication in every detail.`;
+
+  const longDesc = `Crafted to perfection, our ${safeCategory} represents the epitome of luxury and style. Made from exquisite ${safeMetal}, this piece showcases ${safeQuality} that blends traditional artistry with modern aesthetics. Each design reflects a story of passion and precision, enhanced by the brilliance of ${safeDwt} that add a radiant sparkle to your personality. Whether you're attending a grand event, celebrating a milestone, or simply embracing your everyday elegance, this ${safeCategory} is a versatile companion that elevates your ensemble with grace.`;
+
+  return { shortDesc, longDesc };
+}
+
+async function createShopifyProduct(product, locationId) {
+  const designno = product.designno || product.jobno || "UNKNOWN";
+  const jobno = product.jobno || product.designno || "UNKNOWN"; // ✅ Add this line
+  const skuBase = `${designno}-${jobno}`; // ✅ Now this works
+  const qty = parseInt(product.qty || product.Qty || product.stock || 10);
+  const title = product.title?.trim() || product.designno || product.jobno || "Unnamed";
+
+  const gender = product.gender || "Unisex";
+  const metal_type = product.metal_type || "-";
+  const diamond_quality = product.diamond_quality || "-";
+  const metal_color = product.metal_color || "-";
+  const diamond_color = product.diamond_color || "-";
+  const gwt = product.gwt || "0";
+  const nwt = product.nwt || "0";
+  const dwt = product.dwt || "0";
+  const dpcs = product.dpcs || "0";
+
+  const { category, collection, subcategory, images } = await getProductDetail(designno);
+  const categoryUpper = category.toUpperCase();
+
+  // ✅ Tag logic (lowercased)
+  const tags = [gender, metal_type, category, collection, subcategory]
+    .filter(Boolean)
+    .map(tag => tag.toLowerCase());
+
+  const isRing = tags.includes("ring") || tags.includes("rings");
+
+  // ✅ Ring size support from ERP
+  const ringSizeRaw = product.size;
+  const ringSizes = ringSizeRaw.split(",").map(s => s.trim()).filter(Boolean);
+
+  const { shortDesc, longDesc } = generateDescriptions({ category, metal: metal_type, dwt, quality: diamond_quality });
+
+  let options = undefined;
+  let variants = undefined;
+
+  if (isRing && ringSizes.length > 0) {
+    options = [{ name: "Ring Size", values: ringSizes }];
+    variants = ringSizes.map(size => ({
+      option1: size,
+      price: product.amount || "0",
+      sku: `${skuBase}`,
+      inventory_management: "shopify",
+      inventory_quantity: Math.ceil(qty / ringSizes.length),
+      inventory_policy: "deny",
+    }));
+  } else {
+    variants = [{
+      price: product.amount || "0",
+      sku: skuBase,
+      inventory_management: "shopify",
+      inventory_quantity: qty,
+      inventory_policy: "deny",
+    }];
+  }
+
+  const bodyHtml = `
+    <p><strong>${shortDesc}</strong></p>
+    <p>${longDesc}</p>
+     <table class="product-specification-hp">
+      <thead>
+        <tr class="product-specification-header-hp">
+          <th>Specification</th>
+          <th>Details</th>
+        </tr>
+      </thead>
+      <tbody class="product-specification-body-hp">
+        <tr><td>Gender</td><td>${gender}</td></tr>
+        <tr><td>Metal</td><td>${metal_type}</td></tr>
+        <tr><td>Quality</td><td>${diamond_quality}</td></tr>
+        <tr><td>Metal Color</td><td>${metal_color}</td></tr>
+        <tr><td>Gross Weight</td><td>${gwt}g</td></tr>
+        <tr><td>Net Weight</td><td>${nwt}g</td></tr>
+        <tr><td>Diamond Weight</td><td>${dwt}ct</td></tr>
+        <tr><td>Diamond Pieces</td><td>${dpcs}</td></tr>
+        <tr><td>Diamond Color</td><td>${diamond_color}</td></tr>
+      </tbody>
+    </table>`;
+
+  const validImages = images
+    .filter(img => /\.(jpg|jpeg|png|webp)$/i.test(img.image))
+    .map(img => ({ src: img.image.trim() }));
+
+  const productData = {
+    product: {
+      title,
+      product_type: categoryUpper,
+      tags,
+      body_html: bodyHtml,
+      images: validImages,
+      ...(options && { options }),
+      ...(variants && { variants }),
+    },
+  };
+
+  try {
+    const created = await axios.post(
+      `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2023-10/products.json`,
+      productData,
+      { headers: { "X-Shopify-Access-Token": ACCESS_TOKEN } }
+    );
+
+    const newProductId = created.data.product.id;
+
+    await axios.post(
+      `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2023-10/products/${newProductId}/metafields.json`,
+      {
+        metafield: {
+          namespace: SHORT_DESC_NAMESPACE,
+          key: SHORT_DESC_KEY,
+          type: "multi_line_text_field",
+          value: shortDesc,
+        },
+      },
+      { headers: { "X-Shopify-Access-Token": ACCESS_TOKEN } }
+    );
+
+    console.log(`✅ Product created: ${title}`);
+  } catch (err) {
+    console.error(`❌ Failed to create product: ${title}`, err.response?.data || err.message);
+  }
+}
+
+// ✅ Runner
+(async function main() {
+  const products = await fetchERPProducts();
+  const locationId = await getLocationId();
+  if (!locationId) return;
+
+  for (const product of products) {
+    const skuBase = product.jobno || product.designno;
+    const quantity = parseInt(product.qty || product.Qty || product.stock || 0);
+
+    if (!skuBase) continue;
+
+    const existing = await searchVariantBySKU(skuBase);
+    if (existing?.inventoryItemId) {
+      await updateInventory(existing.inventoryItemId, locationId, quantity);
+    } else {
+      await createShopifyProduct(product, locationId);
+    }
+
+    await sleep(600);
+  }
+
+  console.log("🎉 Product check & inventory sync complete.");
+})();
